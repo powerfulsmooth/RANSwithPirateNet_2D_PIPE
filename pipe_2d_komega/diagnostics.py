@@ -49,21 +49,30 @@ def alpha_values(params):
             for k, v in flat.items() if k[-1] == "alpha"}
 
 
-def residual_grid(model, params, nx=96, ne=120):
+def residual_grid(model, params, nx=96, ne=120, chunk=4096):
+    print(f"[1/4] continuity-residual heatmap ({nx}x{ne} pts, 2nd-order AD; "
+          "first chunk includes JIT compile, please wait)...", flush=True)
     xi = jnp.linspace(1e-3, 1.0 - 1e-3, nx)
     eta = jnp.linspace(2e-3, 0.995, ne)
     XI, ETA = jnp.meshgrid(xi, eta)
-    rc, rx, rr, rk, rw = vmap(model.r_point, in_axes=(None, 0, 0))(
-        params, XI.ravel(), ETA.ravel())
-    return (np.array(XI), np.array(ETA),
-            np.array(rc).reshape(ne, nx))
+    r_fn = jax.jit(vmap(model.r_point, in_axes=(None, 0, 0)))
+    xs, es = XI.ravel(), ETA.ravel()
+    rc_parts = []
+    for i in range(0, xs.shape[0], chunk):
+        rc, *_ = r_fn(params, xs[i:i + chunk], es[i:i + chunk])
+        rc_parts.append(np.array(rc))
+        print(f"      {min(i + chunk, xs.shape[0])}/{xs.shape[0]} points done", flush=True)
+    rc_all = np.concatenate(rc_parts)
+    return np.array(XI), np.array(ETA), rc_all.reshape(ne, nx)
 
 
 def radial_fft(model, params, xi_slices=(0.05, 0.25, 0.5, 0.9), ne=256):
+    print("[2/4] radial FFT of r_c at xi slices...", flush=True)
     eta = jnp.linspace(2e-3, 0.995, ne)
+    r_fn = jax.jit(vmap(model.r_point, in_axes=(None, None, 0)))
     out = {}
     for xs in xi_slices:
-        rc, *_ = vmap(model.r_point, in_axes=(None, None, 0))(params, xs, eta)
+        rc, *_ = r_fn(params, jnp.asarray(xs), eta)
         spec = np.abs(np.fft.rfft(np.array(rc))) ** 2
         out[xs] = spec / (spec.sum() + 1e-30)
     return out
@@ -71,6 +80,7 @@ def radial_fft(model, params, xi_slices=(0.05, 0.25, 0.5, 0.9), ne=256):
 
 def grad_cosine_matrix(model, params, batch):
     """Pairwise cosine similarity between per-loss-term parameter gradients."""
+    print("[4/4] per-term gradient cosine matrix (jacobian over params)...", flush=True)
     keys = list(model.loss_keys)
 
     def stacked(p):
@@ -116,6 +126,7 @@ def run(config, workdir):
     axes[0, 1].set_title("r_c radial spectrum (low-k pile-up = spectral bias)")
 
     # ---- 3. U+ profiles vs Reichardt ----
+    print("[3/4] U+ profiles vs Reichardt target...", flush=True)
     eta_p = np.linspace(1e-4, 1 - 1e-5, 300)
     U_target = model._reichardt((1.0 - eta_p) * model.Re_tau)
     for xs, col in [(0.0, "g"), (0.5, "b"), (1.0, "r")]:
