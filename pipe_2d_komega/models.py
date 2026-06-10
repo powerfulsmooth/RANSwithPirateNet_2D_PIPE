@@ -213,10 +213,10 @@ class Pipe2DKOmega(PINN):
         rc_hat = rc * ARRt
         rx_hat = rx
         rr_hat = rr
-        # destruction scales broadcast-safe (use batch-mean for stability)
-        batch_xi, batch_eta = batch[:, 0], batch[:, 1]
-        Kc_b = vmap(lambda a, b: self._K(params, a, b))(batch_xi, batch_eta)
-        Wc_b = vmap(lambda a, b: self._W(params, a, b))(batch_xi, batch_eta)
+        # destruction scales broadcast-safe (use batch-mean for stability);
+        # one vmapped fields() forward gives both K and W
+        F_b = vmap(lambda a, b: self.fields(params, a, b))(batch[:, 0], batch[:, 1])
+        Kc_b, Wc_b = F_b[:, 3], F_b[:, 4]
         denom_k = jnp.mean(BETASTAR * Kc_b * Wc_b) + 1e-8
         denom_w = jnp.mean(BETA * Wc_b ** 2) + 1e-8
         rk_hat = rk / denom_k
@@ -230,40 +230,37 @@ class Pipe2DKOmega(PINN):
             "res_w": jnp.mean(rw_hat**2),
         }
 
-        # ---- axis symmetry at eta->0 ----
+        # ---- axis symmetry at eta->0: single jvp in the eta direction ----
         ec = 1.0e-3
-        dU_c = grad(lambda e: self._U(params, 0.5, e))(ec)
-        dK_c = grad(lambda e: self._K(params, 0.5, e))(ec)
-        dW_c = grad(lambda e: self._W(params, 0.5, e))(ec)
-        ld["sym"] = dU_c**2 + dK_c**2 + dW_c**2
+        _, dF_c = jax.jvp(lambda e: self.fields(params, 0.5, e), (ec,), (1.0,))
+        ld["sym"] = dF_c[0] ** 2 + dF_c[3] ** 2 + dF_c[4] ** 2   # dU, dK, dW
 
         # ---- inlet BC (xi=0): plug flow U+=U_in, V+=0, k+=k_in ----
         # eta limited to [0.05, 0.80] to avoid the near-wall region where the hard BC
         # U=(1-eta)*raw requires raw=U_in/(1-eta) -> large as eta->1.
         eta_pts = jnp.linspace(0.05, 0.80, 16)
-        U_in_hat = vmap(lambda e: self._U(params, 0.0, e))(eta_pts)
-        V_in_hat = vmap(lambda e: self._V(params, 0.0, e))(eta_pts)
-        K_in_hat = vmap(lambda e: self._K(params, 0.0, e))(eta_pts)
-        ld["bc_inlet"] = (jnp.mean((U_in_hat - self.U_in) ** 2) / self.U_in**2
-                          + jnp.mean(V_in_hat**2)
-                          + jnp.mean((K_in_hat - self.k_in) ** 2) / (self.k_in**2 + 1e-8))
+        F_in = vmap(lambda e: self.fields(params, 0.0, e))(eta_pts)   # (16,5)
+        ld["bc_inlet"] = (jnp.mean((F_in[:, 0] - self.U_in) ** 2) / self.U_in**2
+                          + jnp.mean(F_in[:, 1] ** 2)
+                          + jnp.mean((F_in[:, 3] - self.k_in) ** 2) / (self.k_in**2 + 1e-8))
 
-        # ---- outlet BC (xi=1): Neumann dU/dxi=dV/dxi=dK/dxi=dW/dxi=0 ----
-        dU_out = vmap(lambda e: grad(lambda a: self._U(params, a, e))(1.0))(eta_pts)
-        dV_out = vmap(lambda e: grad(lambda a: self._V(params, a, e))(1.0))(eta_pts)
-        dK_out = vmap(lambda e: grad(lambda a: self._K(params, a, e))(1.0))(eta_pts)
-        dW_out = vmap(lambda e: grad(lambda a: self._W(params, a, e))(1.0))(eta_pts)
-        ld["bc_outlet"] = (jnp.mean(dU_out**2) + jnp.mean(dV_out**2)
-                           + jnp.mean(dK_out**2) + jnp.mean(dW_out**2))
+        # ---- outlet BC (xi=1): Neumann d/dxi of U,V,K,W = 0 ----
+        # one jvp in the xi direction per eta point gives all 5 derivatives
+        def _dxi_fields(e):
+            _, d = jax.jvp(lambda a: self.fields(params, a, e), (1.0,), (1.0,))
+            return d
+        D_out = vmap(_dxi_fields)(eta_pts)   # (16,5)
+        ld["bc_outlet"] = (jnp.mean(D_out[:, 0] ** 2) + jnp.mean(D_out[:, 1] ** 2)
+                           + jnp.mean(D_out[:, 3] ** 2) + jnp.mean(D_out[:, 4] ** 2))
 
         # ---- pressure gauge: p=0 at (xi=1, eta=0) ----
-        ld["pgauge"] = self._P(params, 1.0, 0.0) ** 2
+        ld["pgauge"] = self.fields(params, 1.0, 0.0)[2] ** 2
 
         # ---- optional log-law anchor (multiple xi to prevent laminar collapse) ----
         if "anchor" in self.loss_keys:
             anchor_xis = jnp.array([0.5, 0.75, 1.0])
             def _anchor_err(xi_a):
-                Ua = vmap(lambda e: self._U(params, xi_a, e))(self.anchor_eta)
+                Ua = vmap(lambda e: self.fields(params, xi_a, e)[0])(self.anchor_eta)
                 return jnp.mean((Ua - self.anchor_U) ** 2)
             ld["anchor"] = jnp.mean(vmap(_anchor_err)(anchor_xis))
 
