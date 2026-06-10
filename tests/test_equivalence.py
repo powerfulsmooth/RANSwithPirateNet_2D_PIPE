@@ -148,22 +148,30 @@ def losses_ref(model, params, batch):
     dW_c = grad(lambda e: _W(model, params, 0.5, e))(ec)
     ld["sym"] = dU_c**2 + dK_c**2 + dW_c**2
 
-    eta_pts = jnp.linspace(0.05, 0.80, 16)
-    U_in_hat = vmap(lambda e: _U(model, params, 0.0, e))(eta_pts)
-    V_in_hat = vmap(lambda e: _V(model, params, 0.0, e))(eta_pts)
-    K_in_hat = vmap(lambda e: _K(model, params, 0.0, e))(eta_pts)
-    ld["bc_inlet"] = (jnp.mean((U_in_hat - model.U_in) ** 2) / model.U_in**2
+    U_in_hat = vmap(lambda e: _U(model, params, 0.0, e))(model.inlet_eta)
+    V_in_hat = vmap(lambda e: _V(model, params, 0.0, e))(model.inlet_eta)
+    K_in_hat = vmap(lambda e: _K(model, params, 0.0, e))(model.inlet_eta)
+    ld["bc_inlet"] = (jnp.mean((U_in_hat - model.inlet_U) ** 2) / model.U_bulk_fd**2
                       + jnp.mean(V_in_hat**2)
-                      + jnp.mean((K_in_hat - model.k_in) ** 2) / (model.k_in**2 + 1e-8))
+                      + jnp.mean((K_in_hat - model.inlet_K) ** 2) / (model.k_in**2 + 1e-8))
 
-    dU_out = vmap(lambda e: grad(lambda a: _U(model, params, a, e))(1.0))(eta_pts)
-    dV_out = vmap(lambda e: grad(lambda a: _V(model, params, a, e))(1.0))(eta_pts)
-    dK_out = vmap(lambda e: grad(lambda a: _K(model, params, a, e))(1.0))(eta_pts)
-    dW_out = vmap(lambda e: grad(lambda a: _W(model, params, a, e))(1.0))(eta_pts)
+    dU_out = vmap(lambda e: grad(lambda a: _U(model, params, a, e))(1.0))(model.inlet_eta)
+    dV_out = vmap(lambda e: grad(lambda a: _V(model, params, a, e))(1.0))(model.inlet_eta)
+    dK_out = vmap(lambda e: grad(lambda a: _K(model, params, a, e))(1.0))(model.inlet_eta)
+    dW_out = vmap(lambda e: grad(lambda a: _W(model, params, a, e))(1.0))(model.inlet_eta)
     ld["bc_outlet"] = (jnp.mean(dU_out**2) + jnp.mean(dV_out**2)
                        + jnp.mean(dK_out**2) + jnp.mean(dW_out**2))
 
     ld["pgauge"] = _P(model, params, 1.0, 0.0) ** 2
+
+    if "mass" in model.loss_keys:
+        mass_xis = jnp.array([0.25, 0.5, 0.75, 1.0])
+        eta_qm = jnp.linspace(1e-3, 0.999, 32)
+        def _bulk(xi_a):
+            Uq = vmap(lambda e: _U(model, params, xi_a, e))(eta_qm)
+            return 2.0 * jnp.trapezoid(Uq * eta_qm, eta_qm)
+        bulks = vmap(_bulk)(mass_xis)
+        ld["mass"] = jnp.mean((bulks - model.U_bulk_fd) ** 2) / model.U_bulk_fd**2
 
     if "anchor" in model.loss_keys:
         anchor_xis = jnp.array([0.5, 0.75, 1.0])

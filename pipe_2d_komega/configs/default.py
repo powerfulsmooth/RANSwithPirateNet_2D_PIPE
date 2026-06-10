@@ -29,8 +29,10 @@ def get_config():
     optim.beta2 = 0.999
     optim.eps = 1e-8
     optim.learning_rate = 1e-3
-    optim.decay_rate = 0.85
-    optim.decay_steps = 2000
+    # 0.8^(100k/5000) -> final LR ~1.2e-5.  The previous 0.85/2000 schedule
+    # decayed to 2.9e-7 by step 100k, freezing the last half of training.
+    optim.decay_rate = 0.8
+    optim.decay_steps = 5000
 
     config.training = training = ml_collections.ConfigDict()
     training.max_steps = 100000
@@ -44,20 +46,29 @@ def get_config():
     weighting.scheme = "grad_norm"
     weighting.init_weights = ml_collections.ConfigDict({
         "res_c": 1.0, "res_x": 1.0, "res_r": 1.0, "res_k": 1.0, "res_w": 1.0,
-        "sym": 1.0, "bc_inlet": 10.0, "bc_outlet": 1.0, "pgauge": 1.0, "anchor": 1.0,
+        "sym": 1.0, "bc_inlet": 10.0, "bc_outlet": 1.0, "pgauge": 1.0,
+        "anchor": 1.0, "mass": 1.0,
     })
     weighting.momentum = 0.9
     weighting.update_every_steps = 1000
+    # Guards against grad-norm weight explosion (observed: w_res_r -> 1e10 once
+    # res_r hit the float32 noise floor, drowning the unconverged res_c term).
+    weighting.max_weight = 1.0e3
+    weighting.loss_floor = 1.0e-8
 
     config.physics = physics = ml_collections.ConfigDict()
     physics.re_tau = 550.0
     # Aspect ratio L/R: pipe length / pipe radius.
     # L+ = AR * Re_tau wall units.  AR=20 -> L+ = 11000 (moderately long pipe).
     physics.aspect_ratio = 20.0
-    # Plug inlet velocity in wall units.
-    # For Re_tau=550, turbulent bulk ~18-20 u_tau; use flat plug profile.
-    physics.u_inlet = 18.0
-    # Inlet turbulent kinetic energy in wall units (k+ = 3/2*(I*U+)^2, I~5%).
+    # Inlet: "blunted plug" — flat core blended to no-slip across a tanh shear
+    # layer of thickness delta_inlet (wall units).  The plug level is set
+    # internally so the inlet mass flux equals the fully-developed (Reichardt)
+    # bulk velocity at this Re_tau; an explicit u_inlet would over-specify the
+    # problem in wall units (bulk is fixed by the friction law).
+    physics.delta_inlet = 30.0
+    # Inlet turbulent kinetic energy scale in wall units (peak k+ of the inlet
+    # profile; the profile decays to 0 at the wall like the velocity squared).
     physics.k_inlet = 1.0
 
     config.logging = logging = ml_collections.ConfigDict()

@@ -54,10 +54,24 @@ Hard BCs:
   omega wall singularity structural: softplus(net) + 6/(beta*(y++delta)^2)
 
 Soft BCs (as loss terms):
-  Inlet xi=0  : U+=U_in, V+=0, k+=k_in, dk/dr=0, domega/dr=0
+  Inlet xi=0  : blunted plug U+ = U_plug * tanh(y+/delta_in), V+=0,
+                k+ = k_in * (U/U_plug)^2.  The tanh shear layer removes the
+                plug/no-slip corner singularity at (xi=0, eta=1) and is
+                representable by the hard BC U=(1-eta)*raw (raw stays finite
+                at the wall), so the inlet is enforced over the FULL radius —
+                no unconstrained annular band, no mass-flux hole.  U_plug is
+                set so the inlet bulk equals the fully-developed (Reichardt)
+                bulk: in wall units the bulk velocity is fixed by the friction
+                law, an independent u_inlet would over-specify the problem.
   Outlet xi=1 : dU/dxi=dV/dxi=dk/dxi=domega/dxi=0  (Neumann)
   Axis eta=0  : dU/dr=0, dK/dr=0, dW/dr=0  (already implied by hard V BC)
   Pressure    : p=0 at (xi=1, eta=0)  (gauge)
+  Mass        : bulk velocity 2*int U eta d(eta) == U_bulk_fd at several xi
+                (integral mass-conservation constraint)
+  Anchor      : Reichardt profile (smooth viscous->log blend) at several xi,
+                with eta points spanning wall layer AND centreline, so the
+                outer profile / U_center is pinned (the old 2-point log-law
+                anchor left the centreline unconstrained at low Re_tau).
 """
 from functools import partial
 
@@ -82,13 +96,38 @@ class Pipe2DKOmega(PINN):
         self.AR = float(config.physics.aspect_ratio)   # L/R
         self.cx = 1.0 / (self.AR * self.Re_tau)
         self.cr = 1.0 / self.Re_tau
-        self.U_in = float(config.physics.u_inlet)      # plug inlet velocity in wall units
-        self.k_in = float(config.physics.k_inlet)      # inlet k+ (e.g. 0.01*U_in^2)
-        # log-law anchor points for branch selection (optional)
-        yps = np.array([yp for yp in (30.0, 60.0, 120.0, 250.0) if yp < 0.4 * self.Re_tau])
-        self.anchor_eta = jnp.array(1.0 - yps / self.Re_tau)
-        self.anchor_U = jnp.array((1.0 / KAPPA) * np.log(yps) + B_LOG)
-        self.anchor_xi = 1.0  # anchor at downstream end (should approach fully-developed)
+        self.k_in = float(config.physics.k_inlet)      # inlet peak k+ scale
+        self.delta_in = float(config.physics.delta_inlet)  # inlet shear layer (wall units)
+
+        # ---- fully-developed target: Reichardt's wall law ----
+        eta_q = np.linspace(0.0, 1.0, 401)
+        yp_q = (1.0 - eta_q) * self.Re_tau
+        U_fd = self._reichardt(yp_q)
+        # bulk velocity is FIXED by Re_tau in wall units (friction law);
+        # both the inlet mass flux and the mass-conservation loss target it
+        self.U_bulk_fd = 2.0 * float(np.trapezoid(U_fd * eta_q, eta_q))
+
+        # ---- inlet: blunted plug, mass-matched to the FD bulk ----
+        shape = np.tanh(yp_q / self.delta_in)
+        bulk_shape = 2.0 * float(np.trapezoid(shape * eta_q, eta_q))
+        self.U_plug = self.U_bulk_fd / bulk_shape
+        inlet_eta = np.linspace(0.02, 0.98, 24)            # full radius
+        U_in_prof = self.U_plug * np.tanh((1.0 - inlet_eta) * self.Re_tau / self.delta_in)
+        self.inlet_eta = jnp.array(inlet_eta)
+        self.inlet_U = jnp.array(U_in_prof)
+        # k decays to 0 at the wall like U^2 (constant turbulence intensity)
+        self.inlet_K = jnp.array(self.k_in * (U_in_prof / self.U_plug) ** 2)
+
+        # ---- anchor: Reichardt profile across the radius incl. centreline ----
+        anchor_eta = np.array([0.0, 0.15, 0.30, 0.45, 0.60, 0.70, 0.85])
+        self.anchor_eta = jnp.array(anchor_eta)
+        self.anchor_U = jnp.array(self._reichardt((1.0 - anchor_eta) * self.Re_tau))
+
+    @staticmethod
+    def _reichardt(yp):
+        """Reichardt's smooth wall law (viscous sublayer -> log layer blend)."""
+        return ((1.0 / KAPPA) * np.log(1.0 + KAPPA * yp)
+                + 7.8 * (1.0 - np.exp(-yp / 11.0) - (yp / 11.0) * np.exp(-yp / 3.0)))
 
     # ---- reparametrised fields: ONE network forward -> all 5 outputs ----
     # Hard BCs baked in: U,K zero at wall via (1-eta); V zero at axis+wall via
@@ -235,28 +274,38 @@ class Pipe2DKOmega(PINN):
         _, dF_c = jax.jvp(lambda e: self.fields(params, 0.5, e), (ec,), (1.0,))
         ld["sym"] = dF_c[0] ** 2 + dF_c[3] ** 2 + dF_c[4] ** 2   # dU, dK, dW
 
-        # ---- inlet BC (xi=0): plug flow U+=U_in, V+=0, k+=k_in ----
-        # eta limited to [0.05, 0.80] to avoid the near-wall region where the hard BC
-        # U=(1-eta)*raw requires raw=U_in/(1-eta) -> large as eta->1.
-        eta_pts = jnp.linspace(0.05, 0.80, 16)
-        F_in = vmap(lambda e: self.fields(params, 0.0, e))(eta_pts)   # (16,5)
-        ld["bc_inlet"] = (jnp.mean((F_in[:, 0] - self.U_in) ** 2) / self.U_in**2
+        # ---- inlet BC (xi=0): blunted plug over the FULL radius ----
+        # U_in = U_plug * tanh(y+/delta_in) is wall-compatible (raw stays finite
+        # under the hard (1-eta) factor), so no unconstrained annular band.
+        F_in = vmap(lambda e: self.fields(params, 0.0, e))(self.inlet_eta)   # (24,5)
+        ld["bc_inlet"] = (jnp.mean((F_in[:, 0] - self.inlet_U) ** 2) / self.U_bulk_fd**2
                           + jnp.mean(F_in[:, 1] ** 2)
-                          + jnp.mean((F_in[:, 3] - self.k_in) ** 2) / (self.k_in**2 + 1e-8))
+                          + jnp.mean((F_in[:, 3] - self.inlet_K) ** 2) / (self.k_in**2 + 1e-8))
 
         # ---- outlet BC (xi=1): Neumann d/dxi of U,V,K,W = 0 ----
         # one jvp in the xi direction per eta point gives all 5 derivatives
         def _dxi_fields(e):
             _, d = jax.jvp(lambda a: self.fields(params, a, e), (1.0,), (1.0,))
             return d
-        D_out = vmap(_dxi_fields)(eta_pts)   # (16,5)
+        D_out = vmap(_dxi_fields)(self.inlet_eta)   # (24,5)
         ld["bc_outlet"] = (jnp.mean(D_out[:, 0] ** 2) + jnp.mean(D_out[:, 1] ** 2)
                            + jnp.mean(D_out[:, 3] ** 2) + jnp.mean(D_out[:, 4] ** 2))
 
         # ---- pressure gauge: p=0 at (xi=1, eta=0) ----
         ld["pgauge"] = self.fields(params, 1.0, 0.0)[2] ** 2
 
-        # ---- optional log-law anchor (multiple xi to prevent laminar collapse) ----
+        # ---- integral mass conservation: bulk velocity == U_bulk_fd at several xi ----
+        if "mass" in self.loss_keys:
+            mass_xis = jnp.array([0.25, 0.5, 0.75, 1.0])
+            eta_qm = jnp.linspace(1e-3, 0.999, 32)
+            def _bulk(xi_a):
+                Uq = vmap(lambda e: self.fields(params, xi_a, e)[0])(eta_qm)
+                return 2.0 * jnp.trapezoid(Uq * eta_qm, eta_qm)
+            bulks = vmap(_bulk)(mass_xis)
+            ld["mass"] = jnp.mean((bulks - self.U_bulk_fd) ** 2) / self.U_bulk_fd**2
+
+        # ---- optional anchor: Reichardt profile at several xi (branch selection
+        #      + pins the centreline, unlike the old 2-point log-law anchor) ----
         if "anchor" in self.loss_keys:
             anchor_xis = jnp.array([0.5, 0.75, 1.0])
             def _anchor_err(xi_a):
