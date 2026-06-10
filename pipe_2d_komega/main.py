@@ -8,8 +8,13 @@ import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
-sys.path.insert(0, _ROOT)
+# pinncore lives one level up in both repo layouts:
+#   RANSwithPirateNet_2D/examples/pipe_2d_komega  -> ../.. has pinncore  (original)
+#   RANSwithPirateNet_2D_PIPE/pipe_2d_komega      -> ..   has pinncore  (PIPE repo)
+_PARENT = os.path.abspath(os.path.join(_HERE, ".."))
+_GRANDPARENT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+sys.path.insert(0, _GRANDPARENT)
+sys.path.insert(0, _PARENT)
 sys.path.insert(0, _HERE)
 
 import jax
