@@ -174,11 +174,23 @@ def losses_ref(model, params, batch):
         ld["mass"] = jnp.mean((bulks - model.U_bulk_fd) ** 2) / model.U_bulk_fd**2
 
     if "anchor" in model.loss_keys:
-        anchor_xis = jnp.array([0.5, 0.75, 1.0])
         def _anchor_err(xi_a):
             Ua = vmap(lambda e: _U(model, params, xi_a, e))(model.anchor_eta)
             return jnp.mean((Ua - model.anchor_U) ** 2)
-        ld["anchor"] = jnp.mean(vmap(_anchor_err)(anchor_xis))
+        ld["anchor"] = jnp.mean(vmap(_anchor_err)(model.anchor_xis))
+
+    if "anchor_k" in model.loss_keys:
+        def _kanchor_err(xi_a):
+            Ka = vmap(lambda e: _K(model, params, xi_a, e))(model.kanchor_eta)
+            return jnp.mean((Ka - model.kanchor_K) ** 2)
+        ld["anchor_k"] = jnp.mean(vmap(_kanchor_err)(model.anchor_xis)) / model.k_scale**2
+
+    if "wall_shear" in model.loss_keys:
+        def _tau_w(xi_a):
+            dU = grad(lambda e: _U(model, params, xi_a, e))(1.0)
+            return -(1.0 / model.Re_tau) * dU
+        tw = vmap(_tau_w)(model.anchor_xis)
+        ld["wall_shear"] = jnp.mean((tw - 1.0) ** 2)
 
     return ld
 

@@ -119,9 +119,25 @@ class Pipe2DKOmega(PINN):
         self.inlet_K = jnp.array(self.k_in * (U_in_prof / self.U_plug) ** 2)
 
         # ---- anchor: Reichardt profile across the radius incl. centreline ----
+        # Stations retreated to xi={0.75, 1.0}: with stations from xi=0.5 the
+        # V+ field showed development artificially truncated at xi=0.5.
+        self.anchor_xis = jnp.array([0.75, 1.0])
         anchor_eta = np.array([0.0, 0.15, 0.30, 0.45, 0.60, 0.70, 0.85])
         self.anchor_eta = jnp.array(anchor_eta)
         self.anchor_U = jnp.array(self._reichardt((1.0 - anchor_eta) * self.Re_tau))
+
+        # ---- k anchor: approximate fully-developed k-omega k+ profile ----
+        # Without it the U anchor alone admits the trivial branch k->0 (observed:
+        # downstream k+ ~ 0.04-0.1 vs physical O(1-4), nu_t+ ~ 1/20 of physical).
+        # Log-layer equilibrium of the k-omega model: -u'v'+ ~ tau+ = eta (linear
+        # total stress in a pipe) and k+ = tau+/sqrt(beta*), with near-wall
+        # damping (1 - exp(-y+/8))^2 reproducing k+ ~ y+^2 as y+ -> 0.
+        k_eta = np.array([0.30, 0.50, 0.70, 0.85, 0.925, 0.95])
+        k_yp = (1.0 - k_eta) * self.Re_tau
+        k_t = (1.0 / np.sqrt(BETASTAR)) * k_eta * (1.0 - np.exp(-k_yp / 8.0)) ** 2
+        self.kanchor_eta = jnp.array(k_eta)
+        self.kanchor_K = jnp.array(k_t)
+        self.k_scale = 1.0 / np.sqrt(BETASTAR)   # log-layer k+ scale (~3.33)
 
     @staticmethod
     def _reichardt(yp):
@@ -307,11 +323,28 @@ class Pipe2DKOmega(PINN):
         # ---- optional anchor: Reichardt profile at several xi (branch selection
         #      + pins the centreline, unlike the old 2-point log-law anchor) ----
         if "anchor" in self.loss_keys:
-            anchor_xis = jnp.array([0.5, 0.75, 1.0])
             def _anchor_err(xi_a):
                 Ua = vmap(lambda e: self.fields(params, xi_a, e)[0])(self.anchor_eta)
                 return jnp.mean((Ua - self.anchor_U) ** 2)
-            ld["anchor"] = jnp.mean(vmap(_anchor_err)(anchor_xis))
+            ld["anchor"] = jnp.mean(vmap(_anchor_err)(self.anchor_xis))
+
+        # ---- k anchor: blocks the trivial laminar branch (k -> 0) that the
+        #      U-only anchor admits ----
+        if "anchor_k" in self.loss_keys:
+            def _kanchor_err(xi_a):
+                Ka = vmap(lambda e: self.fields(params, xi_a, e)[3])(self.kanchor_eta)
+                return jnp.mean((Ka - self.kanchor_K) ** 2)
+            ld["anchor_k"] = jnp.mean(vmap(_kanchor_err)(self.anchor_xis)) / self.k_scale**2
+
+        # ---- wall shear consistency: dU+/dy+ = 1 at the wall (definition of
+        #      u_tau; exact where the flow is fully developed -> anchor xis).
+        #      The collapsed run had dU+/dy+|wall < 1 (wall-unit inconsistency).
+        if "wall_shear" in self.loss_keys:
+            def _tau_w(xi_a):
+                _, d = jax.jvp(lambda e: self.fields(params, xi_a, e), (1.0,), (1.0,))
+                return -self.cr * d[0]   # dU+/dy+ = -(1/Rt) dU/deta at eta=1
+            tw = vmap(_tau_w)(self.anchor_xis)
+            ld["wall_shear"] = jnp.mean((tw - 1.0) ** 2)
 
         return ld
 

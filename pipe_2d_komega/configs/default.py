@@ -47,7 +47,7 @@ def get_config():
     weighting.init_weights = ml_collections.ConfigDict({
         "res_c": 1.0, "res_x": 1.0, "res_r": 1.0, "res_k": 1.0, "res_w": 1.0,
         "sym": 1.0, "bc_inlet": 10.0, "bc_outlet": 1.0, "pgauge": 1.0,
-        "anchor": 1.0, "mass": 1.0,
+        "anchor": 1.0, "anchor_k": 10.0, "wall_shear": 10.0, "mass": 100.0,
     })
     weighting.momentum = 0.9
     weighting.update_every_steps = 1000
@@ -55,6 +55,9 @@ def get_config():
     # res_r hit the float32 noise floor, drowning the unconverged res_c term).
     weighting.max_weight = 1.0e3
     weighting.loss_floor = 1.0e-8
+    # Per-key weight floors: grad-norm de-prioritised mass (762 -> 69) while
+    # the bulk velocity drifted -1.5% along the pipe.
+    weighting.min_weights = ml_collections.ConfigDict({"mass": 100.0})
 
     config.physics = physics = ml_collections.ConfigDict()
     physics.re_tau = 550.0
