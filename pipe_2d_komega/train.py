@@ -1,4 +1,5 @@
 """Training driver for the 2D developing pipe flow."""
+import math
 import os
 import time
 
@@ -40,16 +41,18 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
         if step % config.logging.log_every_steps == 0 or step == config.training.max_steps - 1:
             log_dict = evaluator(model.state, batch)
+            # jnp scalars -> python floats (wandb can render jnp values as empty charts)
+            log_dict = {k: float(v) for k, v in log_dict.items()}
             dt = time.time() - t0; t0 = time.time()
             msg = " | ".join(f"{k}={v:.2e}" for k, v in log_dict.items())
             print(f"step {step:6d} ({dt:5.1f}s) | {msg}")
             if use_wandb:
                 import wandb
-                wandb.log(log_dict, step)
+                wandb.log(log_dict, step=step)
 
             # NaN guard
             total_loss = sum(v for k, v in log_dict.items() if k.startswith("res_"))
-            if not jax.numpy.isfinite(total_loss):
+            if not math.isfinite(total_loss):
                 print(f"NaN/Inf detected at step {step}, aborting.")
                 break
 
