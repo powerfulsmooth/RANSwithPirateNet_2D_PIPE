@@ -41,6 +41,12 @@ def get_config():
     training.xi_max = 1.0
     training.eta_min = 2e-3
     training.eta_max = 0.995
+    # Entrance/wall-clustered collocation: fraction of each batch drawn with
+    # xi ~ u^s_power (toward inlet) and eta ~ wall-clustered (toward eta_max),
+    # to resolve the thin inlet shear layer of the true-plug entrance problem.
+    training.entrance_cluster_frac = 0.4
+    training.cluster_s_power = 2.0
+    training.cluster_e_power = 1.5
 
     config.weighting = weighting = ml_collections.ConfigDict()
     weighting.scheme = "grad_norm"
@@ -74,15 +80,17 @@ def get_config():
 
     config.physics = physics = ml_collections.ConfigDict()
     physics.re_tau = 550.0
-    # Aspect ratio L/R: pipe length / pipe radius.
-    # L+ = AR * Re_tau wall units.  AR=20 -> L+ = 11000 (moderately long pipe).
-    physics.aspect_ratio = 20.0
-    # Inlet: "blunted plug" — flat core blended to no-slip across a tanh shear
-    # layer of thickness delta_inlet (wall units).  The plug level is set
-    # internally so the inlet mass flux equals the fully-developed (Reichardt)
-    # bulk velocity at this Re_tau; an explicit u_inlet would over-specify the
-    # problem in wall units (bulk is fixed by the friction law).
-    physics.delta_inlet = 30.0
+    # Aspect ratio L/R: pipe length / pipe radius.  Turbulent entrance length
+    # is Le/D ~ 1.6 Re_D^(1/4) ~ 14 D, so AR=32 (L=16D) lets a true plug inlet
+    # develop naturally inside the domain (AR=20 was shorter than Le).
+    physics.aspect_ratio = 32.0
+    # Inlet: near-plug profile U_plug*tanh(y+/delta_inlet).  delta_inlet=6 puts
+    # the inlet wall shear at U_plug/delta ~ 2.5 (>1, decaying downstream like a
+    # real entrance flow) while still regularising the plug/no-slip corner.
+    # The plug level is set internally so the inlet mass flux equals the
+    # fully-developed (Reichardt) bulk velocity at this Re_tau; an explicit
+    # u_inlet would over-specify the problem in wall units.
+    physics.delta_inlet = 6.0
     # Inlet turbulent kinetic energy scale in wall units (peak k+ of the inlet
     # profile; the profile decays to 0 at the wall like the velocity squared).
     physics.k_inlet = 1.0

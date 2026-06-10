@@ -107,11 +107,17 @@ class Pipe2DKOmega(PINN):
         # both the inlet mass flux and the mass-conservation loss target it
         self.U_bulk_fd = 2.0 * float(np.trapezoid(U_fd * eta_q, eta_q))
 
-        # ---- inlet: blunted plug, mass-matched to the FD bulk ----
+        # ---- inlet: near-plug profile, mass-matched to the FD bulk ----
         shape = np.tanh(yp_q / self.delta_in)
         bulk_shape = 2.0 * float(np.trapezoid(shape * eta_q, eta_q))
         self.U_plug = self.U_bulk_fd / bulk_shape
-        inlet_eta = np.linspace(0.02, 0.98, 24)            # full radius
+        # Inlet enforcement points: wall-clustered (geometric in y+) so the thin
+        # tanh shear layer (a few delta_in in extent) is actually resolved by
+        # the BC; a uniform linspace put at most one point inside it.
+        yp_in = np.geomspace(1.0, 0.5 * self.Re_tau, 12)
+        eta_wall = 1.0 - yp_in / self.Re_tau
+        eta_core = np.linspace(0.02, 0.45, 12)
+        inlet_eta = np.sort(np.concatenate([eta_core, eta_wall]))
         U_in_prof = self.U_plug * np.tanh((1.0 - inlet_eta) * self.Re_tau / self.delta_in)
         self.inlet_eta = jnp.array(inlet_eta)
         self.inlet_U = jnp.array(U_in_prof)
@@ -119,9 +125,12 @@ class Pipe2DKOmega(PINN):
         self.inlet_K = jnp.array(self.k_in * (U_in_prof / self.U_plug) ** 2)
 
         # ---- anchor: Reichardt profile across the radius incl. centreline ----
-        # Stations retreated to xi={0.75, 1.0}: with stations from xi=0.5 the
-        # V+ field showed development artificially truncated at xi=0.5.
-        self.anchor_xis = jnp.array([0.75, 1.0])
+        # Outlet station ONLY: with L=16D > entrance length ~14D the flow is
+        # legitimately fully developed at xi=1; interior stations were shown to
+        # truncate the natural development (V structures cut off at the first
+        # station).  wall_shear shares these stations (tau_w+=1 is exact only
+        # where fully developed).
+        self.anchor_xis = jnp.array([1.0])
         anchor_eta = np.array([0.0, 0.15, 0.30, 0.45, 0.60, 0.70, 0.85])
         self.anchor_eta = jnp.array(anchor_eta)
         self.anchor_U = jnp.array(self._reichardt((1.0 - anchor_eta) * self.Re_tau))
@@ -260,14 +269,16 @@ class Pipe2DKOmega(PINN):
             params, batch[:, 0], batch[:, 1]
         )
         # Residual scale normalisation (B2-type fix for 2D cylindrical):
-        #   r_c is O(cx * U_in) ~ O(1.6e-3); multiply by AR*Rt to bring to O(U_in) ~ O(18)
-        #   r_x, r_r: left as-is (O(1) when nut O(Re_tau))
+        #   r_c: multiply by AR*Rt to bring to O(U) units
+        #   r_x, r_r: multiply by Re_tau/2 so the FD forcing scale
+        #             |dp/dx+| = 2/Re_tau maps to O(1) (interpretability +
+        #             keeps momentum on the same footing as the other terms)
         #   r_k, r_w: relative residuals (divide by destruction scales)
         Rt = self.Re_tau
         ARRt = self.AR * Rt
         rc_hat = rc * ARRt
-        rx_hat = rx
-        rr_hat = rr
+        rx_hat = rx * (0.5 * Rt)
+        rr_hat = rr * (0.5 * Rt)
         # destruction scales broadcast-safe (use batch-mean for stability);
         # one vmapped fields() forward gives both K and W
         F_b = vmap(lambda a, b: self.fields(params, a, b))(batch[:, 0], batch[:, 1])
@@ -377,6 +388,27 @@ class Pipe2DKOmega(PINN):
         eta = jnp.linspace(1e-4, 1 - 1e-4, n)
         Up = vmap(lambda e: self._U(params, xi, e))(eta)
         return 2.0 * float(jnp.trapezoid(Up * eta, eta))
+
+    # ---- development diagnostics (entrance-flow signatures) ----
+    def centerline_profile(self, params, n=48):
+        """U+ at the axis along the pipe — accelerates toward FD in entrance flow."""
+        xi = jnp.linspace(0.0, 1.0, n)
+        Uc = vmap(lambda a: self._U(params, a, 0.0))(xi)
+        return np.array(xi), np.array(Uc)
+
+    def wall_shear_profile(self, params, n=48):
+        """tau_w+ = dU+/dy+|wall along the pipe — decays from the inlet value
+        U_plug/delta_in (>1 for a near-plug inlet) toward 1 (fully developed)."""
+        xi = jnp.linspace(0.0, 1.0, n)
+        def _tau(a):
+            _, d = jax.jvp(lambda e: self.fields(params, a, e), (1.0,), (1.0,))
+            return -self.cr * d[0]
+        tw = vmap(_tau)(xi)
+        return np.array(xi), np.array(tw)
+
+    def inlet_profile(self, eta):
+        """Prescribed inlet U+ profile evaluated at numpy eta points."""
+        return self.U_plug * np.tanh((1.0 - np.asarray(eta)) * self.Re_tau / self.delta_in)
 
 
 class Pipe2DEvaluator(BaseEvaluator):

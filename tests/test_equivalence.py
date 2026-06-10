@@ -124,8 +124,8 @@ def losses_ref(model, params, batch):
     Rt = model.Re_tau
     ARRt = model.AR * Rt
     rc_hat = rc * ARRt
-    rx_hat = rx
-    rr_hat = rr
+    rx_hat = rx * (0.5 * Rt)
+    rr_hat = rr * (0.5 * Rt)
     batch_xi, batch_eta = batch[:, 0], batch[:, 1]
     Kc_b = vmap(lambda a, b: _K(model, params, a, b))(batch_xi, batch_eta)
     Wc_b = vmap(lambda a, b: _W(model, params, a, b))(batch_xi, batch_eta)
