@@ -311,9 +311,15 @@ class Pipe2DKOmega(PINN):
         ld["pgauge"] = self.fields(params, 1.0, 0.0)[2] ** 2
 
         # ---- integral mass conservation: bulk velocity == U_bulk_fd at several xi ----
+        # Wall-clustered quadrature: the previous 32-pt uniform trapezoid rule
+        # under-resolved the steep near-wall U gradient, so the optimiser matched
+        # a bulk that was biased ~0.25% high (visible hump in U_bulk(x)).
         if "mass" in self.loss_keys:
             mass_xis = jnp.array([0.25, 0.5, 0.75, 1.0])
-            eta_qm = jnp.linspace(1e-3, 0.999, 32)
+            eta_qm = jnp.concatenate([
+                jnp.linspace(1e-3, 0.90, 33),          # core
+                jnp.linspace(0.90, 0.999, 32)[1:],     # refined wall band
+            ])
             def _bulk(xi_a):
                 Uq = vmap(lambda e: self.fields(params, xi_a, e)[0])(eta_qm)
                 return 2.0 * jnp.trapezoid(Uq * eta_qm, eta_qm)

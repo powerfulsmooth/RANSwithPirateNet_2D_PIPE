@@ -166,7 +166,10 @@ def losses_ref(model, params, batch):
 
     if "mass" in model.loss_keys:
         mass_xis = jnp.array([0.25, 0.5, 0.75, 1.0])
-        eta_qm = jnp.linspace(1e-3, 0.999, 32)
+        eta_qm = jnp.concatenate([
+            jnp.linspace(1e-3, 0.90, 33),
+            jnp.linspace(0.90, 0.999, 32)[1:],
+        ])
         def _bulk(xi_a):
             Uq = vmap(lambda e: _U(model, params, xi_a, e))(eta_qm)
             return 2.0 * jnp.trapezoid(Uq * eta_qm, eta_qm)
