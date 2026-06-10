@@ -6,7 +6,7 @@ import time
 import jax
 import ml_collections
 
-from pinncore.samplers import UniformSampler2D
+from pinncore.samplers import EntranceClusteredSampler2D
 from pinncore.utils import save_params
 
 import models
@@ -22,10 +22,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
     model = models.Pipe2DKOmega(config)
     evaluator = models.Pipe2DEvaluator(config, model)
     sampler = iter(
-        UniformSampler2D(
+        EntranceClusteredSampler2D(
             (config.training.xi_min, config.training.xi_max),
             (config.training.eta_min, config.training.eta_max),
             config.training.batch_size,
+            cluster_frac=config.training.get("entrance_cluster_frac", 0.0),
+            s_power=config.training.get("cluster_s_power", 2.0),
+            e_power=config.training.get("cluster_e_power", 1.5),
             rng_key=jax.random.PRNGKey(config.seed),
         )
     )
