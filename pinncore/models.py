@@ -72,6 +72,7 @@ class PINN:
             ld = self.losses(p, batch)
             return jnp.stack([ld[k] for k in self.loss_keys])
 
+        L = stacked_losses(params)
         J = jax.jacobian(stacked_losses)(params)
         # J is a pytree with the same structure as params but with an extra leading
         # axis of size len(loss_keys).  Slice each row to get per-term grad norm.
@@ -80,7 +81,19 @@ class PINN:
             for i, k in enumerate(self.loss_keys)
         }
         total = sum(norms.values())
-        return {k: total / norms[k] for k in self.loss_keys}
+        # Guard against the M6-type pathology observed in training: once a loss
+        # term reaches the float32 noise floor its gradient norm collapses and
+        # total/norm explodes to 1e9-1e10, so the optimizer amplifies pure noise
+        # and degrades the remaining unconverged terms.  Two guards:
+        #   1. clamp every weight at max_weight,
+        #   2. terms whose loss is already below loss_floor revert to weight 1
+        #      (they are converged; they must not hoard gradient budget).
+        max_w = float(self.config.weighting.get("max_weight", 1.0e3))
+        floor = float(self.config.weighting.get("loss_floor", 1.0e-8))
+        return {
+            k: jnp.where(L[i] < floor, 1.0, jnp.minimum(total / norms[k], max_w))
+            for i, k in enumerate(self.loss_keys)
+        }
 
     @partial(jit, static_argnums=(0,))
     def update_weights(self, state, batch):
