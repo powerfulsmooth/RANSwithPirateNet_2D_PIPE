@@ -107,6 +107,21 @@ class PINN:
         w_new = self.compute_weights(state.params, batch)
         m = self.config.weighting.momentum
         w = {k: m * state.weights[k] + (1 - m) * w_new[k] for k in self.loss_keys}
+        # Optional per-key weight annealing (weighting.anneal): data-assimilation
+        # terms (e.g. an empirical-profile anchor) are needed early for branch
+        # selection but are NOT exact solutions of the PDE; once the right branch
+        # is established they conflict with the residuals (observed: grad cosine
+        # anchor vs res_x ~ -0.75).  After start_step the listed keys decay by
+        # `rate` every `period` steps, floored at weight 1.
+        ann = self.config.weighting.get("anneal", None)
+        if ann:
+            start = float(ann["start_step"])
+            rate = float(ann["rate"])
+            period = float(ann["period"])
+            expo = jnp.maximum(state.step - start, 0.0) / period
+            factor = jnp.power(rate, expo)
+            for k in tuple(ann["keys"]):
+                w[k] = jnp.maximum(w[k] * factor, 1.0)
         return state.replace(weights=w)
 
     @partial(jit, static_argnums=(0,))

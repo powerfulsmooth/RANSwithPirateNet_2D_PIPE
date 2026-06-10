@@ -58,6 +58,19 @@ def get_config():
     # Per-key weight floors: grad-norm de-prioritised mass (762 -> 69) while
     # the bulk velocity drifted -1.5% along the pipe.
     weighting.min_weights = ml_collections.ConfigDict({"mass": 100.0})
+    # Anchor annealing: the Reichardt U anchor and the approximate k anchor are
+    # empirical, not exact k-omega solutions; once the turbulent branch is
+    # established they fight the momentum residual (grad cosine anchor/res_x
+    # ~ -0.75 at convergence).  Decay them in the second half of training so
+    # the PDE settles on its own fully-developed solution.  wall_shear and
+    # mass stay: they are exact physics and together forbid laminar collapse
+    # (tau_w+=1 with bulk 14.28 is incompatible with a laminar profile).
+    weighting.anneal = ml_collections.ConfigDict({
+        "keys": ("anchor", "anchor_k"),
+        "start_step": 40000,
+        "rate": 0.5,
+        "period": 5000,
+    })
 
     config.physics = physics = ml_collections.ConfigDict()
     physics.re_tau = 550.0
