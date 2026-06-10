@@ -17,8 +17,20 @@ sys.path.insert(0, _GRANDPARENT)
 sys.path.insert(0, _PARENT)
 sys.path.insert(0, _HERE)
 
+# Reduce XLA autotuning cost on slow GPUs (Colab T4) — must be set before jax import.
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=1")
+
 import jax
 jax.config.update("jax_default_matmul_precision", "highest")
+
+# Persistent compilation cache: the first session compiles, later sessions reuse.
+# Override the location with JAX_CACHE_DIR (e.g. a mounted Drive path on Colab).
+_CACHE_DIR = os.environ.get("JAX_CACHE_DIR", os.path.join(_HERE, ".jax_cache"))
+try:
+    jax.config.update("jax_compilation_cache_dir", _CACHE_DIR)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1)
+except Exception:
+    pass  # older jax without the persistent-cache options
 
 from absl import app, flags
 from ml_collections import config_flags
