@@ -90,59 +90,66 @@ class Pipe2DKOmega(PINN):
         self.anchor_U = jnp.array((1.0 / KAPPA) * np.log(yps) + B_LOG)
         self.anchor_xi = 1.0  # anchor at downstream end (should approach fully-developed)
 
-    # ---- reparametrised fields (scalar xi, eta -> scalars) ----
-    def _raw(self, params, xi, eta):
-        return self.state.apply_fn(params, jnp.array([xi, eta]))
+    # ---- reparametrised fields: ONE network forward -> all 5 outputs ----
+    # Hard BCs baked in: U,K zero at wall via (1-eta); V zero at axis+wall via
+    # eta*(1-eta); k>=0 via softplus; omega wall singularity structural.
+    def fields(self, params, xi, eta):
+        out = self.state.apply_fn(params, jnp.array([xi, eta]))
+        yp = (1.0 - eta) * self.Re_tau
+        U = (1.0 - eta) * out[0]
+        V = eta * (1.0 - eta) * out[1]
+        P = out[2]
+        K = (1.0 - eta) * jax.nn.softplus(out[3])
+        W = jax.nn.softplus(out[4]) + 6.0 / (BETA * (yp + DELTA) ** 2)
+        return jnp.array([U, V, P, K, W])
 
+    # scalar accessors (diagnostics / evaluator API; avoid in hot loops)
     def _U(self, params, xi, eta):
-        return (1.0 - eta) * self._raw(params, xi, eta)[0]
+        return self.fields(params, xi, eta)[0]
 
     def _V(self, params, xi, eta):
-        # zero at axis (eta=0) and wall (eta=1)
-        return eta * (1.0 - eta) * self._raw(params, xi, eta)[1]
+        return self.fields(params, xi, eta)[1]
 
     def _P(self, params, xi, eta):
-        return self._raw(params, xi, eta)[2]
+        return self.fields(params, xi, eta)[2]
 
     def _K(self, params, xi, eta):
-        return (1.0 - eta) * jax.nn.softplus(self._raw(params, xi, eta)[3])
+        return self.fields(params, xi, eta)[3]
 
     def _W(self, params, xi, eta):
-        yp = (1.0 - eta) * self.Re_tau
-        return jax.nn.softplus(self._raw(params, xi, eta)[4]) + 6.0 / (BETA * (yp + DELTA) ** 2)
-
-    # ---- cylindrical divergence helper ----
-    # (1/r+) d(r+ f) / dr+ = (1/(eta*Rt)) * d(eta * f(xi,eta)) / d(eta)
-    # Implemented as a single JAX grad of (eta*f) to avoid the 1/r split.
-    # eta_safe is used for BOTH the gradient evaluation point and the denominator
-    # so that the autodiff graph is consistent (JAX BUG fix: eta vs eta_safe).
-    @staticmethod
-    def _cyl_div_r(f_func, xi, eta_safe, Rt):
-        d = grad(lambda e: e * f_func(xi, e))(eta_safe)
-        return d / (eta_safe * Rt)
+        return self.fields(params, xi, eta)[4]
 
     # ---- PDE residuals at one collocation point ----
+    # Compile-friendly formulation: instead of ~40 independent grad(closure)
+    # sub-graphs (one per derivative, each re-running the network), the network
+    # is traced through THREE shared computations:
+    #   1. fields(z)            -> values of all 5 fields
+    #   2. jacfwd(fields)(z)    -> all 10 first derivatives at once
+    #   3. jacfwd(flux_vec)(z)  -> all 8 second-order flux derivatives at once
+    # The physics (residual definitions, B1 fix alpha*S2, S2, cylindrical
+    # divergence (1/r+) d(r+ f)/dr+ = d(eta*f)/deta / (eta_safe*Rt)) is
+    # numerically identical to the closure-based version (see
+    # tests/test_equivalence.py).  eta_safe is used for BOTH the evaluation
+    # point and the denominator (original "JAX BUG fix" intent preserved);
+    # for eta >= 1e-8 (always true: sampler min is 2e-3) eta_safe == eta.
     def r_point(self, params, xi, eta):
         cx, cr, Rt = self.cx, self.cr, self.Re_tau
-
-        U = lambda a, b: self._U(params, a, b)
-        V = lambda a, b: self._V(params, a, b)
-        P = lambda a, b: self._P(params, a, b)
-        K = lambda a, b: self._K(params, a, b)
-        W = lambda a, b: self._W(params, a, b)
-        nut = lambda a, b: K(a, b) / W(a, b)
-
-        # first-order derivatives (wall units)
-        Ux = cx * grad(U, 0)(xi, eta); Ur = cr * grad(U, 1)(xi, eta)
-        Vx = cx * grad(V, 0)(xi, eta); Vr = cr * grad(V, 1)(xi, eta)
-        Px = cx * grad(P, 0)(xi, eta); Pr = cr * grad(P, 1)(xi, eta)
-        Kx = cx * grad(K, 0)(xi, eta); Kr = cr * grad(K, 1)(xi, eta)
-        Wx = cx * grad(W, 0)(xi, eta); Wr = cr * grad(W, 1)(xi, eta)
-
-        Uc = U(xi, eta); Vc = V(xi, eta)
-        Kc = K(xi, eta); Wc = W(xi, eta)
-        nutc = Kc / Wc
         eta_safe = jnp.maximum(eta, 1e-8)
+        z = jnp.array([xi, eta_safe])
+
+        f = lambda zz: self.fields(params, zz[0], zz[1])
+
+        F = f(z)                 # (5,)  field values
+        J = jax.jacfwd(f)(z)     # (5,2) d/dxi (col 0), d/deta (col 1)
+
+        Uc, Vc, Kc, Wc = F[0], F[1], F[3], F[4]
+        Ux, Ur = cx * J[0, 0], cr * J[0, 1]
+        Vx, Vr = cx * J[1, 0], cr * J[1, 1]
+        Px, Pr = cx * J[2, 0], cr * J[2, 1]
+        Kx, Kr = cx * J[3, 0], cr * J[3, 1]
+        Wx, Wr = cx * J[4, 0], cr * J[4, 1]
+
+        nutc = Kc / Wc
         Vr_plus = Vc / (eta_safe * Rt)   # V / r+
 
         # strain rate invariant S^2 = 2 SijSij (axisymmetric cylindrical)
@@ -152,33 +159,40 @@ class Pipe2DKOmega(PINN):
         # ---- continuity ----
         r_c = Ux + Vr + Vr_plus  # = cx Uxi + cr Veta + V/r+
 
-        # ---- x-momentum diffusion ----
-        # tau_xx = 2(1+nut)*Ux,  tau_rx = (1+nut)*(Ur+Vx)
-        tau_xx = lambda a, b: 2.0 * (1.0 + nut(a, b)) * cx * grad(U, 0)(a, b)
-        tau_rx = lambda a, b: (1.0 + nut(a, b)) * (cr * grad(U, 1)(a, b) + cx * grad(V, 0)(a, b))
-        DiffU = (cx * grad(tau_xx, 0)(xi, eta)
-                 + self._cyl_div_r(tau_rx, xi, eta_safe, Rt))
-        r_x = Uc * Ux + Vc * Ur + Px - DiffU
+        # ---- all 8 second-order fluxes in ONE traced function ----
+        # entries 0-3: x-direction fluxes (need d/dxi)
+        # entries 4-7: eta * radial fluxes (need d/deta; cylindrical form)
+        def flux_vec(zz):
+            Fv = f(zz)
+            Jv = jax.jacfwd(f)(zz)
+            nut_v = Fv[3] / Fv[4]
+            Ux_, Ur_ = cx * Jv[0, 0], cr * Jv[0, 1]
+            Vx_, Vr_ = cx * Jv[1, 0], cr * Jv[1, 1]
+            Kx_, Kr_ = cx * Jv[3, 0], cr * Jv[3, 1]
+            Wx_, Wr_ = cx * Jv[4, 0], cr * Jv[4, 1]
+            e = zz[1]
+            tau_xx = 2.0 * (1.0 + nut_v) * Ux_
+            tau_rx = (1.0 + nut_v) * (Ur_ + Vx_)
+            tau_rr = 2.0 * (1.0 + nut_v) * Vr_
+            gkx = (1.0 + SIGMASTAR * nut_v) * Kx_
+            gkr = (1.0 + SIGMASTAR * nut_v) * Kr_
+            gwx = (1.0 + SIGMA * nut_v) * Wx_
+            gwr = (1.0 + SIGMA * nut_v) * Wr_
+            return jnp.array([tau_xx, tau_rx, gkx, gwx,
+                              e * tau_rx, e * tau_rr, e * gkr, e * gwr])
 
-        # ---- r-momentum diffusion ----
-        # tau_rr = 2(1+nut)*Vr,  tau_xr = tau_rx  (symmetric)
+        G = jax.jacfwd(flux_vec)(z)   # (8,2)
+        inv_rp = 1.0 / (eta_safe * Rt)
+
+        DiffU = cx * G[0, 0] + G[4, 1] * inv_rp
         # hoop stress: 2(1+nut)*V/r+ enters as -tau_theta_theta/r+
-        tau_rr = lambda a, b: 2.0 * (1.0 + nut(a, b)) * cr * grad(V, 1)(a, b)
-        DiffV = (cx * grad(tau_rx, 0)(xi, eta)
-                 + self._cyl_div_r(tau_rr, xi, eta_safe, Rt)
-                 - 2.0 * (1.0 + nutc) * Vc / (eta_safe * Rt) ** 2)
+        DiffV = cx * G[1, 0] + G[5, 1] * inv_rp - 2.0 * (1.0 + nutc) * Vc * inv_rp**2
+        DiffK = cx * G[2, 0] + G[6, 1] * inv_rp
+        DiffW = cx * G[3, 0] + G[7, 1] * inv_rp
+
+        r_x = Uc * Ux + Vc * Ur + Px - DiffU
         r_r = Uc * Vx + Vc * Vr + Pr - DiffV
-
-        # ---- k diffusion ----
-        gkx = lambda a, b: (1.0 + SIGMASTAR * nut(a, b)) * cx * grad(K, 0)(a, b)
-        gkr = lambda a, b: (1.0 + SIGMASTAR * nut(a, b)) * cr * grad(K, 1)(a, b)
-        DiffK = cx * grad(gkx, 0)(xi, eta) + self._cyl_div_r(gkr, xi, eta_safe, Rt)
         r_k = Uc * Kx + Vc * Kr - Pk + BETASTAR * Kc * Wc - DiffK
-
-        # ---- omega diffusion ----
-        gwx = lambda a, b: (1.0 + SIGMA * nut(a, b)) * cx * grad(W, 0)(a, b)
-        gwr = lambda a, b: (1.0 + SIGMA * nut(a, b)) * cr * grad(W, 1)(a, b)
-        DiffW = cx * grad(gwx, 0)(xi, eta) + self._cyl_div_r(gwr, xi, eta_safe, Rt)
         # B1-type fix: alpha*(W/K)*Pk = alpha*S2  (avoids 0/0 when K->0)
         r_w = Uc * Wx + Vc * Wr - ALPHA * S2 + BETA * Wc**2 - DiffW
 
